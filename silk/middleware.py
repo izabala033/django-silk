@@ -1,13 +1,17 @@
 import logging
 import random
 
-from django.db import DatabaseError, transaction
+from django.conf import settings
+from django.db import DatabaseError, router, transaction
 from django.db.models.sql.compiler import SQLCompiler
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
+from silk import models
 from silk.collector import DataCollector
 from silk.config import SilkyConfig
+from silk.errors import SilkNotConfigured
 from silk.model_factory import RequestModelFactory, ResponseModelFactory
 from silk.profiling import dynamic
 from silk.profiling.profiler import silk_meta_profiler
@@ -15,12 +19,12 @@ from silk.sql import execute_sql
 
 from tenants.utils import get_current_tenant
 
-Logger = logging.getLogger('silk.middleware')
+Logger = logging.getLogger("silk.middleware")
 
 
 def silky_reverse(name, *args, **kwargs):
     try:
-        r = reverse('silk:%s' % name, *args, **kwargs)
+        r = reverse("silk:%s" % name, *args, **kwargs)
     except NoReverseMatch:
         # In case user forgets to set namespace, but also fixes Django 1.5 tests on Travis
         # Hopefully if user has forgotten to add namespace there are no clashes with their own
@@ -30,10 +34,15 @@ def silky_reverse(name, *args, **kwargs):
 
 
 def get_fpath():
-    return silky_reverse('summary')
+    return silky_reverse("summary")
 
 
 config = SilkyConfig()
+AUTH_AND_SESSION_MIDDLEWARES = [
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+]
 
 
 def _should_intercept(request):
@@ -66,10 +75,26 @@ class TestMiddleware:
 
 class SilkyMiddleware:
     def __init__(self, get_response):
+        if config.SILKY_AUTHENTICATION and not (
+            set(AUTH_AND_SESSION_MIDDLEWARES) & set(settings.MIDDLEWARE)
+        ):
+            raise SilkNotConfigured(
+                _(
+                    "SILKY_AUTHENTICATION can not be enabled without Session, "
+                    "Authentication or Message Django's middlewares"
+                )
+            )
+
         self.get_response = get_response
 
     def __call__(self, request):
         self.process_request(request)
+
+        # To be able to persist filters when Session and Authentication
+        # middlewares are not present.
+        # Unlike session (which stores in DB) it won't persist filters
+        # after refresh the page.
+        request.silk_filters = {}
 
         response = self.get_response(request)
 
@@ -80,24 +105,26 @@ class SilkyMiddleware:
     def _apply_dynamic_mappings(self):
         dynamic_profile_configs = config.SILKY_DYNAMIC_PROFILING
         for conf in dynamic_profile_configs:
-            module = conf.get('module')
-            function = conf.get('function')
-            start_line = conf.get('start_line')
-            end_line = conf.get('end_line')
-            name = conf.get('name')
+            module = conf.get("module")
+            function = conf.get("function")
+            start_line = conf.get("start_line")
+            end_line = conf.get("end_line")
+            name = conf.get("name")
             if module and function:
                 if start_line and end_line:  # Dynamic context manager
-                    dynamic.inject_context_manager_func(module=module,
-                                                        func=function,
-                                                        start_line=start_line,
-                                                        end_line=end_line,
-                                                        name=name)
+                    dynamic.inject_context_manager_func(
+                        module=module,
+                        func=function,
+                        start_line=start_line,
+                        end_line=end_line,
+                        name=name,
+                    )
                 else:  # Dynamic decorator
-                    dynamic.profile_function_or_method(module=module,
-                                                       func=function,
-                                                       name=name)
+                    dynamic.profile_function_or_method(
+                        module=module, func=function, name=name
+                    )
             else:
-                raise KeyError('Invalid dynamic mapping %s' % conf)
+                raise KeyError("Invalid dynamic mapping %s" % conf)
 
     @silk_meta_profiler()
     def process_request(self, request):
@@ -106,10 +133,10 @@ class SilkyMiddleware:
         if not _should_intercept(request):
             return
 
-        Logger.debug('process_request')
+        Logger.debug("process_request")
         request.silk_is_intercepted = True
         self._apply_dynamic_mappings()
-        if not hasattr(SQLCompiler, '_execute_sql'):
+        if not hasattr(SQLCompiler, "_execute_sql"):
             SQLCompiler._execute_sql = SQLCompiler.execute_sql
             SQLCompiler.execute_sql = execute_sql
 
@@ -122,6 +149,7 @@ class SilkyMiddleware:
         request_model = RequestModelFactory(request).construct_request_model()
         DataCollector().configure(request_model, should_profile=should_profile)
 
+    @transaction.atomic(using=router.db_for_write(models.SQLQuery))
     def _process_response(self, request, response):
         Logger.debug("Process response")
         with transaction.atomic(using=get_current_tenant()):
@@ -147,13 +175,20 @@ class SilkyMiddleware:
             Logger.debug("Process response done.")
 
     def process_response(self, request, response):
-        if getattr(request, 'silk_is_intercepted', False):
-            while True:
+        max_attempts = 2
+        attempts = 1
+        if getattr(request, "silk_is_intercepted", False):
+            while attempts <= max_attempts:
+                if attempts > 1:
+                    Logger.debug("Retrying _process_response; attempt %s" % attempts)
                 try:
                     self._process_response(request, response)
-                except (AttributeError, DatabaseError):
-                    Logger.debug('Retrying _process_response')
-                    self._process_response(request, response)
-                finally:
                     break
+                except (AttributeError, DatabaseError):
+                    if attempts >= max_attempts:
+                        Logger.warning(
+                            "Exhausted _process_response attempts; not processing request"
+                        )
+                        break
+                attempts += 1
         return response

@@ -27,17 +27,6 @@ content_type_html = ['text/html']
 content_type_css = ['text/css']
 
 
-def _get_response_headers(response):
-    """
-    Django 3.2 (more specifically, commit bcc2befd0e9c1885e45b46d0b0bcdc11def8b249) broke the usage of _headers, which
-    were turned into a public interface, so we need this compatibility wrapper.
-    """
-    try:
-        return response.headers
-    except AttributeError:
-        return response._headers
-
-
 class DefaultEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, UUID):
@@ -77,19 +66,17 @@ class RequestModelFactory:
         """
         From Django docs (https://docs.djangoproject.com/en/2.0/ref/request-response/#httprequest-objects):
         """
-        headers = {}
-        sensitive_headers = {'authorization'}
+        sensitive_headers = set(map(str.lower, SilkyConfig().SILKY_SENSITIVE_KEYS))
+        sensitive_headers.add('authorization')
+        if SilkyConfig().SILKY_HIDE_COOKIES:
+            sensitive_headers.add('cookie')
 
+        headers = {}
         for k, v in self.request.headers.items():
+            k = k.lower()
             if k in sensitive_headers:
                 v = RequestModelFactory.CLEANSED_SUBSTITUTE
-
             headers[k] = v
-        if SilkyConfig().SILKY_HIDE_COOKIES:
-            try:
-                del headers['COOKIE']
-            except KeyError:
-                pass
 
         return json.dumps(headers, cls=DefaultEncoder, ensure_ascii=SilkyConfig().SILKY_JSON_ENSURE_ASCII)
 
@@ -104,7 +91,7 @@ class RequestModelFactory:
             pattern = re.compile(key_string, re.I)
             if isinstance(obj, dict):
                 for key in obj.keys():
-                    if pattern.search(key):
+                    if key_string and pattern.search(key):
                         obj[key] = RequestModelFactory.CLEANSED_SUBSTITUTE
                     else:
                         obj[key] = replace_pattern_values(obj[key])
@@ -112,18 +99,19 @@ class RequestModelFactory:
                 for index, item in enumerate(obj):
                     obj[index] = replace_pattern_values(item)
             else:
-                if pattern.search(str(obj)):
+                if key_string and pattern.search(str(obj)):
                     return RequestModelFactory.CLEANSED_SUBSTITUTE
             return obj
 
         try:
             json_body = json.loads(body)
         except Exception as e:
-            pattern = re.compile(fr'(({key_string})[^=]*)=(.*?)(&|$)', re.M | re.I)
-            try:
-                body = re.sub(pattern, f'\\1={RequestModelFactory.CLEANSED_SUBSTITUTE}\\4', body)
-            except Exception:
-                Logger.debug(f'{str(e)}')
+            if key_string:
+                pattern = re.compile(fr'(({key_string})[^=]*)=(.*?)(&|$)', re.M | re.I)
+                try:
+                    body = re.sub(pattern, f'\\1={RequestModelFactory.CLEANSED_SUBSTITUTE}\\4', body)
+                except Exception:
+                    Logger.debug(f'{str(e)}')
         else:
             body = json.dumps(replace_pattern_values(json_body), ensure_ascii=SilkyConfig().SILKY_JSON_ENSURE_ASCII)
 
@@ -291,15 +279,11 @@ class ResponseModelFactory:
                         )
             if content and content_type in content_types_json:
                 # TODO: Perhaps theres a way to format the JSON without parsing it?
-                if not isinstance(content, str):
-                    # byte string is not compatible with json.loads(...)
-                    # and json.dumps(...) in python3
-                    content = content.decode()
                 try:
                     body = json.dumps(json.loads(content), sort_keys=True, indent=4
                                       , ensure_ascii=SilkyConfig().SILKY_JSON_ENSURE_ASCII)
                 except (TypeError, ValueError):
-                    Logger.warn(
+                    Logger.warning(
                         'Response to request with pk %s has content type %s but was unable to parse it'
                         % (self.request.pk, content_type)
                     )
@@ -312,9 +296,8 @@ class ResponseModelFactory:
             % self.request.pk
         )
         b, content = self.body()
-        raw_headers = _get_response_headers(self.response)
         headers = {}
-        for k, v in raw_headers.items():
+        for k, v in self.response.headers.items():
             try:
                 header, val = v
             except ValueError:
