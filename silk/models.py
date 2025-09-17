@@ -5,7 +5,7 @@ import re
 from uuid import uuid4
 
 import sqlparse
-from django.core.files.storage import get_storage_class
+from silk.storage import ProfilerResultStorage
 from django.db import models, transaction
 from django.db.models import (
     BooleanField,
@@ -24,8 +24,9 @@ from django.utils.safestring import mark_safe
 
 from silk.config import SilkyConfig
 from silk.utils.profile_parser import parse_profile
+from tenants.utils import get_current_tenant
 
-silk_storage = get_storage_class(SilkyConfig().SILKY_STORAGE_CLASS)()
+silk_storage = ProfilerResultStorage()
 
 
 # Seperated out so can use in tests w/o models
@@ -221,18 +222,19 @@ class Response(models.Model):
 
 # TODO rewrite docstring
 class SQLQueryManager(models.Manager):
-    @transaction.atomic
-    def bulk_create(self, *args, **kwargs):
-        """ensure that num_sql_queries remains consistent. Bulk create does not call
-        the model save() method and hence we must add this logic here too"""
-        if len(args):
-            objs = args[0]
-        else:
-            objs = kwargs.get('objs')
-        for obj in objs:
-            obj.prepare_save()
 
-        return super().bulk_create(*args, **kwargs)
+    def bulk_create(self, *args, **kwargs):
+        with transaction.atomic(using=get_current_tenant()):
+            """ensure that num_sql_queries remains consistent. Bulk create does not call
+            the model save() method and hence we must add this logic here too"""
+            if len(args):
+                objs = args[0]
+            else:
+                objs = kwargs.get("objs")
+            for obj in objs:
+                obj.prepare_save()
+
+            return super().bulk_create(*args, **kwargs)
 
 
 class SQLQuery(models.Model):
@@ -312,16 +314,16 @@ class SQLQuery(models.Model):
                 self.request.num_sql_queries += 1
                 self.request.save(update_fields=['num_sql_queries'])
 
-    @transaction.atomic()
     def save(self, *args, **kwargs):
-        self.prepare_save()
-        super().save(*args, **kwargs)
+        with transaction.atomic(using=get_current_tenant()):
+            self.prepare_save()
+            super().save(*args, **kwargs)
 
-    @transaction.atomic()
     def delete(self, *args, **kwargs):
-        self.request.num_sql_queries -= 1
-        self.request.save()
-        super().delete(*args, **kwargs)
+        with transaction.atomic(using=get_current_tenant()):
+            self.request.num_sql_queries -= 1
+            self.request.save()
+            super().delete(*args, **kwargs)
 
 
 class BaseProfile(models.Model):
