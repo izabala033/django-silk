@@ -27,7 +27,6 @@ from django.utils.safestring import mark_safe
 
 from silk.config import SilkyConfig
 from silk.utils.profile_parser import parse_profile
-from tenants.utils import get_current_tenant
 
 try:
     silk_storage = storages["SILKY_STORAGE"]

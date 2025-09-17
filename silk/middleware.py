@@ -17,8 +17,6 @@ from silk.profiling import dynamic
 from silk.profiling.profiler import silk_meta_profiler
 from silk.sql import execute_sql
 
-from tenants.utils import get_current_tenant
-
 Logger = logging.getLogger("silk.middleware")
 
 
@@ -152,27 +150,26 @@ class SilkyMiddleware:
     @transaction.atomic(using=router.db_for_write(models.SQLQuery))
     def _process_response(self, request, response):
         Logger.debug("Process response")
-        with transaction.atomic(using=get_current_tenant()):
-            with silk_meta_profiler():
-                collector = DataCollector()
-                collector.stop_python_profiler()
-                silk_request = collector.request
-                if silk_request:
-                    ResponseModelFactory(response).construct_response_model()
-                    silk_request.end_time = timezone.now()
-                    collector.finalise()
-                else:
-                    Logger.error(
-                        "No request model was available when processing response. "
-                        "Did something go wrong in process_request/process_view?"
-                        "\n" + str(request) + "\n\n" + str(response)
-                    )
-            # Need to save the data outside the silk_meta_profiler
-            # Otherwise the  meta time collected in the context manager
-            # is not taken in account
+        with silk_meta_profiler():
+            collector = DataCollector()
+            collector.stop_python_profiler()
+            silk_request = collector.request
             if silk_request:
-                silk_request.save()
-            Logger.debug("Process response done.")
+                ResponseModelFactory(response).construct_response_model()
+                silk_request.end_time = timezone.now()
+                collector.finalise()
+            else:
+                Logger.error(
+                    "No request model was available when processing response. "
+                    "Did something go wrong in process_request/process_view?"
+                    "\n" + str(request) + "\n\n" + str(response)
+                )
+        # Need to save the data outside the silk_meta_profiler
+        # Otherwise the  meta time collected in the context manager
+        # is not taken in account
+        if silk_request:
+            silk_request.save()
+        Logger.debug("Process response done.")
 
     def process_response(self, request, response):
         max_attempts = 2
